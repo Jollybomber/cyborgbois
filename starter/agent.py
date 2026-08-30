@@ -125,8 +125,26 @@ BUYING_HINT_RE = re.compile(
 HARD_ATTRIBUTES = ("material", "color", "size", "brand", "budget")
 SOFT_ATTRIBUTES = ("style", "use_case", "feature")
 
+# The shopper profile is deliberately a fixed schema rather than an
+# opportunistic bag of extracted terms.  `budget` is the public API name for
+# the question, while `price_range` is the product-preference field it fills.
+PRODUCT_FEATURE_FIELDS = (
+    "category", "material", "color", "size", "price_range", "style", "feature",
+)
+NO_PREFERENCE_RE = re.compile(
+    r"\b(?:no|don't have|do not have|without|doesn't matter|does not matter)\b.*\b(?:preference|preference for)\b|"
+    r"\b(?:anything|any)\s+(?:is\s+)?fine\b",
+    re.IGNORECASE,
+)
+QUESTION_TO_FEATURE_FIELD = {"budget": "price_range"}
+
 ASK_PRIORITY_BUYING = ["material", "size", "color", "budget", "style", "brand", "use_case", "feature"]
 ASK_PRIORITY_BROWSING = ["use_case", "category", "style", "material", "color", "budget", "brand", "feature"]
+# These lists intentionally contain every field in PRODUCT_FEATURE_FIELDS.
+# They are used while completing the fixed product-preference record; the
+# broader lists above are retained for supplemental refinement afterwards.
+CORE_ASK_PRIORITY_BUYING = ["category", "material", "size", "color", "budget", "style", "feature"]
+CORE_ASK_PRIORITY_BROWSING = ["category", "style", "material", "color", "budget", "feature", "size"]
 
 ASK_TEMPLATES = {
     "category": "What type of item are you shopping for?",
@@ -359,15 +377,28 @@ def llm_rerank(context_summary: str, candidates: list[tuple[str, str]]) -> tuple
 @dataclass
 class SessionState:
     profile: dict = field(default_factory=dict)
+    # Always contains all seven core product-preference fields.  A value of
+    # None means that the customer has not supplied that preference yet.
+    product_features: dict[str, str | None] = field(
+        default_factory=lambda: dict.fromkeys(PRODUCT_FEATURE_FIELDS)
+    )
     slots: dict[str, str] = field(default_factory=dict)
     budget_value: float | None = None
     hard_order: list[str] = field(default_factory=list)   # order slots were filled, for relaxation
     asked_attributes: set[str] = field(default_factory=set)
+    last_asked_attribute: str | None = None
     intent: str | None = None
     turns_seen: int = 0
 
     def filled_relevant_count(self) -> int:
         return len([a for a in HARD_ATTRIBUTES + SOFT_ATTRIBUTES if a in self.slots])
+
+    def set_slot(self, attribute: str, value: str) -> None:
+        """Persist a raw search slot and mirror it into the fixed schema."""
+        self.slots[attribute] = value
+        feature_field = QUESTION_TO_FEATURE_FIELD.get(attribute, attribute)
+        if feature_field in self.product_features:
+            self.product_features[feature_field] = value
 
 
 class Agent:
@@ -436,6 +467,14 @@ class Agent:
             raise RuntimeError("reset must be called before respond")
         state.turns_seen = turn
 
+        # A customer saying that a requested preference does not matter is a
+        # useful answer, not a missing value.  Record it in the fixed schema
+        # without putting a meaningless "any" term into catalog retrieval.
+        if state.last_asked_attribute and NO_PREFERENCE_RE.search(user_message):
+            feature_field = QUESTION_TO_FEATURE_FIELD.get(state.last_asked_attribute, state.last_asked_attribute)
+            if feature_field in state.product_features:
+                state.product_features[feature_field] = "any"
+
         # II. Dialog state machine: override detection wipes prior *hard*
         # constraints only. Category and soft attributes (style/use_case/
         # feature) are kept, since overrides in practice replace one
@@ -443,8 +482,17 @@ class Agent:
         # the attribute from asked_attributes lets the agent re-ask it if
         # it turns out to still matter.
         if state.slots and OVERRIDE_RE.search(user_message):
-            kept_category = state.slots.get("category")
-            state.slots = {"category": kept_category} if kept_category else {}
+            # Preserve the non-hard descriptive context, but reset the fixed
+            # feature record so it accurately represents the active request.
+            kept_slots = {
+                attribute: state.slots[attribute]
+                for attribute in ("category", *SOFT_ATTRIBUTES)
+                if attribute in state.slots
+            }
+            state.slots = {}
+            state.product_features = dict.fromkeys(PRODUCT_FEATURE_FIELDS)
+            for attribute, value in kept_slots.items():
+                state.set_slot(attribute, value)
             state.hard_order = []
             state.budget_value = None
 
@@ -452,7 +500,7 @@ class Agent:
         gained_hard_slot = False
         for attribute, value in new_slots.items():
             is_new_or_changed = state.slots.get(attribute) != value
-            state.slots[attribute] = value
+            state.set_slot(attribute, value)
             if attribute in HARD_ATTRIBUTES and is_new_or_changed:
                 if attribute in state.hard_order:
                     state.hard_order.remove(attribute)
@@ -477,7 +525,7 @@ class Agent:
             llm_input_tokens += usage["input_tokens"]
             llm_output_tokens += usage["output_tokens"]
             for attribute, value in llm_slots.items():
-                state.slots[attribute] = value
+                state.set_slot(attribute, value)
                 if attribute in HARD_ATTRIBUTES:
                     if attribute in state.hard_order:
                         state.hard_order.remove(attribute)
@@ -537,10 +585,13 @@ class Agent:
         ask_attribute = self._choose_ask_attribute(state, over_generality, turn)
         if ask_attribute:
             state.asked_attributes.add(ask_attribute)
+            state.last_asked_attribute = ask_attribute
             message = ASK_TEMPLATES[ask_attribute]
         elif recommendations:
+            state.last_asked_attribute = None
             message = f"Here are {len(recommendations)} matches based on what you've told me so far."
         else:
+            state.last_asked_attribute = None
             message = "I couldn't find a close match yet -- could you tell me more about what you need?"
 
         return {
@@ -565,8 +616,33 @@ class Agent:
     def _choose_ask_attribute(self, state: SessionState, over_generality: bool, turn: int) -> str | None:
         if turn >= MAX_TURNS:
             return None  # no more customer turns will follow; asking wastes it
-        should_ask = over_generality or state.filled_relevant_count() < MIN_FILLED_SLOTS_BEFORE_ASK_STOPS
-        if not should_ask:
+
+        # Completion of the seven-field preference record is the primary
+        # dialogue goal.  We keep asking for the next missing field even when
+        # retrieval is already narrow, so later turns improve both recall and
+        # the explanation of why a product was recommended.  `budget` is the
+        # API-facing question name for the `price_range` state field.
+        missing_core = [
+            feature for feature in PRODUCT_FEATURE_FIELDS
+            if state.product_features[feature] is None
+        ]
+        if missing_core:
+            core_priority = (
+                CORE_ASK_PRIORITY_BUYING
+                if state.intent == "buying"
+                else CORE_ASK_PRIORITY_BROWSING
+            )
+            for attribute in core_priority:
+                feature_field = QUESTION_TO_FEATURE_FIELD.get(attribute, attribute)
+                if feature_field not in missing_core or attribute in state.asked_attributes:
+                    continue
+                return attribute
+
+        # Once the core record is complete, only ask a further question when
+        # the current retrieval is still too broad.  These can be the
+        # supplemental brand/use_case fields, which remain useful for search
+        # but are not part of the seven required product features.
+        if not over_generality:
             return None
         priority = ASK_PRIORITY_BUYING if state.intent == "buying" else ASK_PRIORITY_BROWSING
         category_text = state.slots.get("category", "").lower()
