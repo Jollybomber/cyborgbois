@@ -1,0 +1,10 @@
+# Generated local semantic index. Rebuild from the frozen catalog; do not commit it.
+data/catalog_vectors.sqlite3
+data/catalog_vectors.sqlite3-*
+
+# Local credentials
+.env
+
+
+__pycache__/
+*.pyc

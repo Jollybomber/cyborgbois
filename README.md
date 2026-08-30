@@ -43,6 +43,32 @@ python3 -m evaluator.local_evaluator
 Edit `starter/agent.py` to implement your system. Do not edit the evaluator or public labels when reporting your local score.
 The command writes per-session results and aggregate metrics to `results.json`.
 
+## Optional local semantic index
+
+For dense or hybrid retrieval, build the local, resumable SQLite embedding store.
+This uses Gemini Embedding 1 and intentionally avoids server-based vector
+database infrastructure. Install the small client dependencies first; the
+generated index is ignored by Git.
+
+```bash
+# Add GEMINI_API_KEY=... to .env
+python3 -m pip install -r requirements.txt
+python3 scripts/build_vector_store.py build
+python3 scripts/build_vector_store.py query "lightweight waterproof hiking shoe"
+```
+
+The builder uses `ratelimit` plus exponential `backoff` and strictly caps calls
+to Gemini at 100 requests per rolling minute. Its default is one product per
+request, so the cap also maps directly to at most 100 product embeddings per
+minute. A full 50,000-product build therefore takes at least about 8 hours and
+20 minutes; it resumes safely after interruption. If Gemini responds with a
+429 quota rejection, the script logs it, waits 30 seconds, and retries the
+same unsaved batch.
+
+Use the dense results as a candidate source or reranking signal alongside the
+starter's lexical FTS/BM25 retrieval; embeddings are not a replacement for
+exact category, brand, color, size, or budget filters.
+
 The included weak BM25 starter scores Hit Rate@10 `0.125`, MRR `0.068034`, and
 MTTC `9.81` on the released public set. See `docs/baseline_results.json`.
 
