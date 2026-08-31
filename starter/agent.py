@@ -704,7 +704,11 @@ class Agent:
         # Dense retrieval is a recall-oriented second route.  It is merged
         # with FTS results before the deterministic feature-aware reranker.
         if self.embedding_index is not None:
-            dense_query = self._describe_state(state) + "\nUser: " + user_message
+            # Embed only the latest validated slot state. This runs after
+            # the final LLM plan has been merged, so stale raw wording,
+            # profile tags, plan prose, and prior messages cannot dilute the
+            # similarity query.
+            dense_query = self._embedding_query(state)
             dense_candidates = self.embedding_index.search(
                 dense_query, LOCAL_EMBEDDING_CANDIDATES
             )
@@ -762,6 +766,11 @@ class Agent:
         if tags:
             parts.append("general preferences: " + ", ".join(tags))
         return "; ".join(parts) if parts else "no specific constraints stated yet"
+
+    @staticmethod
+    def _embedding_query(state: SessionState) -> str:
+        """Stable dense-retrieval input containing only current slots."""
+        return json.dumps(state.slots, ensure_ascii=False, sort_keys=True)
 
     def _hybrid_rank(
         self,
