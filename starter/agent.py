@@ -195,6 +195,8 @@ SOFT_ATTRIBUTES = ("style", "use_case", "feature")
 PRODUCT_FEATURE_FIELDS = (
     "category", "material", "color", "size", "price_range", "style", "feature",
 )
+LLM_SLOT_FIELDS = ("category", *HARD_ATTRIBUTES, *SOFT_ATTRIBUTES)
+LLM_INTENTS = {"buying", "browsing", "unknown"}
 NO_PREFERENCE_RE = re.compile(
     r"\b(?:no|don't have|do not have|without|doesn't matter|does not matter)\b.*\b(?:preference|preference for)\b|"
     r"\b(?:anything|any)\s+(?:is\s+)?fine\b",
@@ -460,38 +462,64 @@ def _parse_json_block(text: str) -> object | None:
         return None
 
 
-def llm_extract_slots(message: str, missing_attributes: list[str]) -> tuple[dict[str, str], dict]:
-    """Fallback slot extraction for phrasing the regex vocabulary misses
-    (e.g. "water resistant" when only "waterproof" is a known keyword).
-    Only worth calling when the cheap regex pass found nothing new.
+def llm_build_turn_plan(
+    conversation: list[dict[str, str]], state_snapshot: dict, profile_tags: list[str]
+) -> tuple[dict | None, dict]:
+    """Create the final pre-retrieval plan from the full conversation.
+
+    The model never writes a file and its output is not exposed through the
+    public agent API.  We validate it before merging it into SessionState so
+    malformed output cannot alter the retrieval path.
     """
     empty_usage = {"input_tokens": 0, "output_tokens": 0}
-    if not missing_attributes:
-        return {}, empty_usage
     system = (
-        "You extract shopping preference attributes from one customer message. "
-        "Reply with strict minified JSON only -- no prose, no markdown fences. "
-        "Only include keys from the allowed list where the message states a clear value. "
-        "Values must be short, at most 4 words."
+        "You are the structured request planner for a shopping search agent. "
+        "Reply with strict minified JSON only: no prose or markdown. "
+        "Return exactly these keys: intent, slots, budget, query_terms, summary, next_attribute. "
+        "intent is buying, browsing, or unknown. slots is an object using only the allowed "
+        "attribute keys and only clear customer-stated values. budget is a numeric maximum or null. "
+        "query_terms is up to 10 short search phrases grounded in the request. summary is a concise "
+        "statement of the active request. next_attribute is one allowed attribute or null."
     )
     user = (
-        f"Allowed attribute keys: {', '.join(missing_attributes)}.\n"
-        f"Customer message: {message!r}\n"
-        'Example reply shape: {"material": "leather", "feature": "water resistant"}'
+        f"Allowed slot keys: {', '.join(LLM_SLOT_FIELDS)}.\n"
+        f"Allowed next_attribute values: {', '.join(ASK_TEMPLATES)}, or null.\n"
+        f"Current structured state JSON: {json.dumps(state_snapshot, ensure_ascii=False)}.\n"
+        f"Profile preference tags: {json.dumps(profile_tags, ensure_ascii=False)}.\n"
+        f"Entire conversation, oldest first: {json.dumps(conversation, ensure_ascii=False)}"
     )
-    result = _call_llm(system, user, max_tokens=150)
+    result = _call_llm(system, user, max_tokens=350)
     if result is None:
-        return {}, empty_usage
+        return None, empty_usage
     text, usage = result
     data = _parse_json_block(text)
     if not isinstance(data, dict):
-        return {}, usage
-    extracted = {
-        key: str(value)[:60]
-        for key, value in data.items()
-        if key in missing_attributes and value
+        return None, usage
+    raw_slots = data.get("slots")
+    slots = {
+        key: str(value).strip()[:60]
+        for key, value in (raw_slots.items() if isinstance(raw_slots, dict) else [])
+        if key in LLM_SLOT_FIELDS and value and str(value).strip()
     }
-    return extracted, usage
+    budget = data.get("budget")
+    if not isinstance(budget, (int, float)) or isinstance(budget, bool) or budget < 0:
+        budget = None
+    query_terms = data.get("query_terms")
+    if not isinstance(query_terms, list):
+        query_terms = []
+    query_terms = [str(term).strip()[:60] for term in query_terms[:10] if str(term).strip()]
+    next_attribute = data.get("next_attribute")
+    if next_attribute not in ASK_TEMPLATES:
+        next_attribute = None
+    intent = str(data.get("intent", "unknown")).lower()
+    return {
+        "intent": intent if intent in LLM_INTENTS else "unknown",
+        "slots": slots,
+        "budget": float(budget) if budget is not None else None,
+        "query_terms": list(dict.fromkeys(query_terms)),
+        "summary": str(data.get("summary", "")).strip()[:300],
+        "next_attribute": next_attribute,
+    }, usage
 
 
 def llm_rerank(context_summary: str, candidates: list[tuple[str, str]]) -> tuple[list[str] | None, dict]:
@@ -543,6 +571,10 @@ class SessionState:
     asked_attributes: set[str] = field(default_factory=set)
     last_asked_attribute: str | None = None
     intent: str | None = None
+    # Latest validated LLM output. This is deliberately session-local and
+    # never persisted to disk or returned by the competition API.
+    turn_plan: dict | None = None
+    conversation: list[dict[str, str]] = field(default_factory=list)
     turns_seen: int = 0
 
     def filled_relevant_count(self) -> int:
@@ -648,6 +680,7 @@ class Agent:
         if state is None:
             raise RuntimeError("reset must be called before respond")
         state.turns_seen = turn
+        state.conversation.append({"role": "user", "content": user_message})
         _debug(f"session={session_id} turn={turn} question={user_message!r}")
 
         # A customer saying that a requested preference does not matter is a
@@ -698,25 +731,50 @@ class Agent:
         llm_input_tokens = 0
         llm_output_tokens = 0
 
-        # LLM slot-extraction fallback: only worth the call when the cheap
-        # regex pass found nothing new this turn but attributes remain
-        # unfilled -- catches phrasing regex vocab lists miss entirely
-        # (e.g. "water resistant" vs. the known keyword "waterproof").
-        if LLM_ENABLED and not new_slots and new_budget is None:
-            missing = [a for a in HARD_ATTRIBUTES + SOFT_ATTRIBUTES if a not in state.slots]
-            llm_slots, usage = llm_extract_slots(user_message, missing)
+        # Final planning stage: after deterministic extraction but before
+        # route retrieval, compile the entire conversation and current JSON
+        # state into one high-information plan.
+        if LLM_ENABLED:
+            state_snapshot = {
+                "intent": state.intent,
+                "slots": state.slots,
+                "product_features": state.product_features,
+                "budget_value": state.budget_value,
+                "asked_attributes": sorted(state.asked_attributes),
+            }
+            turn_plan, usage = llm_build_turn_plan(
+                state.conversation, state_snapshot, state.profile.get("preference_tags") or []
+            )
             llm_input_tokens += usage["input_tokens"]
             llm_output_tokens += usage["output_tokens"]
-            for attribute, value in llm_slots.items():
+            if turn_plan is not None:
+                state.turn_plan = turn_plan
+                print(
+                    "[agent] final_llm_turn_plan="
+                    + json.dumps(turn_plan, ensure_ascii=False, sort_keys=True),
+                    flush=True,
+                )
+            for attribute, value in (turn_plan or {}).get("slots", {}).items():
+                is_new_or_changed = state.slots.get(attribute) != value
                 state.set_slot(attribute, value)
-                if attribute in HARD_ATTRIBUTES:
+                if attribute in HARD_ATTRIBUTES and is_new_or_changed:
                     if attribute in state.hard_order:
                         state.hard_order.remove(attribute)
                     state.hard_order.append(attribute)
                     gained_hard_slot = True
+            planned_budget = (turn_plan or {}).get("budget")
+            if planned_budget is not None:
+                state.budget_value = planned_budget
+                state.set_slot("budget", f"under ${int(planned_budget)}")
+                if "budget" not in state.hard_order:
+                    state.hard_order.append("budget")
+                gained_hard_slot = True
 
-        # I. Intent routing (sticky toward "buying" once a hard constraint appears).
-        if gained_hard_slot or BUYING_HINT_RE.search(user_message):
+        # I. Intent routing. A validated plan is the primary route selector;
+        # heuristic signals keep the no-LLM/failure path fully functional.
+        if state.turn_plan and state.turn_plan["intent"] in {"buying", "browsing"}:
+            state.intent = state.turn_plan["intent"]
+        elif gained_hard_slot or BUYING_HINT_RE.search(user_message):
             state.intent = "buying"
         elif state.intent is None:
             state.intent = "browsing" if BROWSING_HINT_RE.search(user_message) else "buying"
@@ -729,6 +787,8 @@ class Agent:
                 optional_terms.append(state.slots[attribute])
         optional_terms.extend(_terms(user_message))
         optional_terms.extend(state.profile.get("preference_tags") or [])
+        if state.turn_plan:
+            optional_terms.extend(state.turn_plan["query_terms"])
         optional_terms = list(dict.fromkeys(t for t in optional_terms if t))
 
         if state.intent == "browsing":
@@ -757,7 +817,11 @@ class Agent:
         # Dense retrieval is a recall-oriented second route.  It is merged
         # with FTS results before the deterministic feature-aware reranker.
         if self.embedding_index is not None:
-            dense_query = self._describe_state(state) + "\nUser: " + user_message
+            # Embed only the latest validated slot state. This runs after
+            # the final LLM plan has been merged, so stale raw wording,
+            # profile tags, plan prose, and prior messages cannot dilute the
+            # similarity query.
+            dense_query = self._embedding_query(state)
             dense_candidates = self.embedding_index.search(
                 dense_query, LOCAL_EMBEDDING_CANDIDATES
             )
@@ -766,16 +830,14 @@ class Agent:
                 state, rating_bias, top_k
             )
 
-        # LLM semantic re-ranking: bm25 can't discriminate between many
-        # products sharing one generic matched term (e.g. "leather" hits
-        # thousands of unrelated items). Only worth the call on the Buying
-        # track with real constraints in play, where ranking precision
-        # (MRR) is what's being left on the table.
+        # Rerank only a small candidate pool after the selected route has
+        # retrieved it. The final plan is the context, so this call can use
+        # the full request rather than a single user utterance.
         if LLM_ENABLED and state.intent == "buying" and expression:
             pool = self._fetch_titles(expression, budget_used, rating_bias, LLM_RERANK_POOL_SIZE)
             if pool:
-                context_summary = self._describe_state(state)
-                reranked, usage = llm_rerank(context_summary, pool)
+                rerank_context = (state.turn_plan or {}).get("summary") or self._describe_state(state)
+                reranked, usage = llm_rerank(rerank_context, pool)
                 llm_input_tokens += usage["input_tokens"]
                 llm_output_tokens += usage["output_tokens"]
                 if reranked:
@@ -798,6 +860,8 @@ class Agent:
             state.last_asked_attribute = None
             message = "I couldn't find a close match yet -- could you tell me more about what you need?"
 
+        state.conversation.append({"role": "assistant", "content": message})
+
         return {
             "message": message,
             "ask_attribute": ask_attribute,
@@ -815,6 +879,11 @@ class Agent:
         if tags:
             parts.append("general preferences: " + ", ".join(tags))
         return "; ".join(parts) if parts else "no specific constraints stated yet"
+
+    @staticmethod
+    def _embedding_query(state: SessionState) -> str:
+        """Stable dense-retrieval input containing only current slots."""
+        return json.dumps(state.slots, ensure_ascii=False, sort_keys=True)
 
     def _hybrid_rank(
         self,
