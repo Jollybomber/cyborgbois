@@ -1,6 +1,7 @@
 # Generated local semantic index. Rebuild from the frozen catalog; do not commit it.
 data/catalog_vectors.sqlite3
 data/catalog_vectors.sqlite3-*
+data/bge-small-en-v1.5/
 
 # Local credentials
 .env
