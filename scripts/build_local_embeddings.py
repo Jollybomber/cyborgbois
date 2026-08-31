@@ -8,7 +8,13 @@ from pathlib import Path
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-from local_embeddings import DEFAULT_MODEL, DEFAULT_MODEL_DIR, catalog_documents
+from local_embeddings import (
+    DEFAULT_MODEL,
+    DEFAULT_MODEL_DIR,
+    INDEX_SCHEMA_VERSION,
+    QUERY_INSTRUCTION,
+    catalog_documents,
+)
 
 
 def main() -> None:
@@ -41,7 +47,17 @@ def main() -> None:
         convert_to_numpy=True,
     ).astype("float32")
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(args.output, ids=np.asarray(ids), vectors=vectors, model=np.asarray(args.model))
+    np.savez(
+        args.output,
+        ids=np.asarray(ids),
+        vectors=vectors,
+        # Keep `model` for backward compatibility and use model_id for the
+        # canonical identity independent of the local directory used to load it.
+        model=np.asarray(args.model),
+        model_id=np.asarray(args.model),
+        query_instruction=np.asarray(QUERY_INSTRUCTION),
+        schema_version=np.asarray(INDEX_SCHEMA_VERSION),
+    )
     print(f"Wrote {len(ids)} embeddings ({vectors.shape[1]} dimensions) to {args.output}")
 
 

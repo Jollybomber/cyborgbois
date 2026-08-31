@@ -1,0 +1,42 @@
+{
+  "agent": "context_planner_hybrid_v1",
+  "dataset": "data/public_set.jsonl",
+  "sample_count": 200,
+  "configuration": {
+    "llm_enabled": false,
+    "dense_enabled": false,
+    "question_policy": "candidate_information_gain",
+    "uses_public_labels_at_runtime": false
+  },
+  "hit_rate_at_10": 0.84,
+  "mrr": 0.542938,
+  "mttc": 3.855,
+  "efficiency": 0.7145,
+  "technical_score": 0.725781,
+  "scenario_metrics": {
+    "boundary": {
+      "sample_count": 10,
+      "hit_rate_at_10": 0.7,
+      "mrr": 0.453571,
+      "mttc": 5.9
+    },
+    "browsing": {
+      "sample_count": 80,
+      "hit_rate_at_10": 0.925,
+      "mrr": 0.643433,
+      "mttc": 3.0875
+    },
+    "buying": {
+      "sample_count": 80,
+      "hit_rate_at_10": 0.8,
+      "mrr": 0.454459,
+      "mttc": 3.6125
+    },
+    "intent_override": {
+      "sample_count": 30,
+      "hit_rate_at_10": 0.766667,
+      "mrr": 0.540688,
+      "mttc": 5.866667
+    }
+  }
+}

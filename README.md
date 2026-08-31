@@ -32,20 +32,60 @@ mv catalog.jsonl data/catalog.jsonl
 
 Verify the downloaded file using the published `SHA256SUMS` file.
 
-## Run the Starter
+## Run the Agent
 
-Python 3.10 or later is recommended. The starter uses only the Python standard library.
+Python 3.10 or later is recommended. The deterministic lexical fallback uses
+only the standard library; install `requirements.txt` to enable local dense
+retrieval.
 
 ```bash
 python3 -m evaluator.local_evaluator
 ```
 
-Edit `starter/agent.py` to implement your system. Do not edit the evaluator or public labels when reporting your local score.
 The command writes per-session results and aggregate metrics to `results.json`.
+Do not edit the evaluator or public labels when reporting a local score.
 
-## Optional local semantic index
+### Pipeline architecture
 
-For dense or hybrid retrieval, build the local, resumable SQLite embedding store.
+On every turn the agent:
+
+1. appends the message to session history and updates active structured facts;
+2. removes superseded soft facts when the customer changes intent;
+3. optionally asks Groq or Anthropic for a strict JSON search plan;
+4. generates exact-phrase, grouped FTS/BM25, broad lexical, and BGE dense
+   candidate routes;
+5. fuses the candidate union using route rank, category and constraint
+   coverage, exclusions, price, and a small quality/profile signal;
+6. optionally asks the LLM to rerank the short fused list; and
+7. returns the current Top 10 while independently choosing at most one useful
+   clarification from candidate-pool information gain.
+
+Clarification and recommendation are deliberately concurrent: a response can
+return ten recommendations and ask one question. The agent never reads
+`public_set.jsonl`, labels, intent cards, ground truth, or target identifiers.
+
+### Optional LLM planner and reranker
+
+The pipeline works without a model API. To enable the planner and semantic
+reranker, set either provider in the ignored repository-root `.env` file:
+
+```bash
+# Preferred when both keys exist
+GROQ_API_KEY=...
+AGENT_LLM_MODEL=openai/gpt-oss-20b
+
+# Or use Anthropic
+# ANTHROPIC_API_KEY=...
+# AGENT_LLM_MODEL=claude-haiku-4-5-20251001
+```
+
+Set `AGENT_LLM_RERANK=0` to retain LLM planning but disable the second model
+call. Any model, network, or JSON failure falls back to the deterministic plan
+and ranking path.
+
+## Optional Gemini embedding experiment
+
+The standalone Gemini script can build a resumable SQLite embedding store.
 This uses Gemini Embedding 1 and intentionally avoids server-based vector
 database infrastructure. Install the small client dependencies first; the
 generated index is ignored by Git.
@@ -65,9 +105,9 @@ minute. A full 50,000-product build therefore takes at least about 8 hours and
 429 quota rejection, the script logs it, waits 30 seconds, and retries the
 same unsaved batch.
 
-Use the dense results as a candidate source alongside the starter's lexical
-FTS/BM25 retrieval; embeddings are not a replacement for
-exact category, brand, color, size, or budget filters.
+This store is an experimentation utility; the runtime agent uses the local BGE
+index described below. Embeddings supplement rather than replace exact
+category, brand, color, size, or budget evidence.
 
 ### Offline local embeddings
 
@@ -121,6 +161,10 @@ locally and does not contact Hugging Face. Remove or override
 
 The included weak BM25 starter scores Hit Rate@10 `0.125`, MRR `0.068034`, and
 MTTC `9.81` on the released public set. See `docs/baseline_results.json`.
+
+The deterministic context-planning pipeline (no LLM and dense retrieval
+disabled for this ablation) scores Hit Rate@10 `0.84`, MRR `0.542938`, MTTC
+`3.855`, and TechnicalScore `0.725781`. See `docs/pipeline_results.json`.
 
 ## Agent Interface
 

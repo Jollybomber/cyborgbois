@@ -9,3 +9,4 @@ data/bge-small-en-v1.5/
 
 __pycache__/
 *.pyc
+.venv/
