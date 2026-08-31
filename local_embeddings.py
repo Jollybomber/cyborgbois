@@ -86,12 +86,33 @@ class LocalEmbeddingIndex:
             model_path = snapshot_download(model_name, local_files_only=True)
         self.model = SentenceTransformer(model_path)
 
-    def search(self, text: str, top_k: int = 100) -> list[tuple[str, float]]:
-        if not text or not self.ids:
-            return []
-        query = self.model.encode(
+    def embed_query(self, text: str):
+        """Return a normalized query vector compatible with this index."""
+        if not text:
+            return None
+        return self.model.encode(
             [QUERY_INSTRUCTION + text], normalize_embeddings=True, show_progress_bar=False
         )[0].astype("float32", copy=False)
+
+    def search(self, query_embedding: object, top_k: int = 100) -> list[tuple[str, float]]:
+        """Return the closest catalog entries for a precomputed query vector.
+
+        Catalog vectors are normalized during index construction. Normalize the
+        supplied query here as well so callers may pass either a raw embedding
+        or one already normalized by their embedding provider.
+        """
+        if query_embedding is None or not self.ids or top_k <= 0:
+            return []
+        query = self._np.asarray(query_embedding, dtype="float32")
+        if query.ndim != 1 or query.shape[0] != self.vectors.shape[1]:
+            raise ValueError(
+                "query embedding must be a one-dimensional vector with "
+                f"{self.vectors.shape[1]} dimensions"
+            )
+        magnitude = self._np.linalg.norm(query)
+        if magnitude == 0:
+            return []
+        query = query / magnitude
         scores = self.vectors @ query
         count = min(top_k, len(scores))
         if count == len(scores):

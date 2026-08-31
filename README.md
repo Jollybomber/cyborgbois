@@ -50,13 +50,23 @@ python3 -m evaluator.local_evaluator --max-questions 2
 Edit `starter/agent.py` to implement your system. Do not edit the evaluator or public labels when reporting your local score.
 The command writes per-session results and aggregate metrics to `results.json`.
 
-### Optional Groq assist
+### Optional LLM assist
 
-The agent uses its deterministic retrieval path by default. To enable the
-optional slot-extraction and reranking assist, put a Groq API key in the
-repository-root `.env` file (which is ignored by Git):
+The agent uses deterministic retrieval by default when no compatible model is
+available. Select the optional LLM backend with `AGENT_LLM_PROVIDER` in the
+repository-root `.env` file (which is ignored by Git). The default is a local
+Hugging Face model:
 
 ```bash
+AGENT_LLM_PROVIDER=huggingface  # or hf
+# Optional; defaults to Qwen/Qwen2.5-1.5B-Instruct
+AGENT_LLM_MODEL=Qwen/Qwen2.5-1.5B-Instruct
+```
+
+To use the restored Groq backend instead, set the provider and API key:
+
+```bash
+AGENT_LLM_PROVIDER=groq
 GROQ_API_KEY=...
 # Optional; defaults to openai/gpt-oss-20b
 AGENT_LLM_MODEL=openai/gpt-oss-120b
@@ -68,8 +78,8 @@ Values already set in your shell take precedence over `.env`. Then run:
 python3 -m evaluator.local_evaluator
 ```
 
-To print each customer question, retrieval trace, and any Groq API calls during
-a local run, add `AGENT_DEBUG=1` to `.env`.
+To print each customer question, retrieval trace, and any LLM calls during a
+local run, add `AGENT_DEBUG=1` to `.env`.
 
 ## Optional local semantic index
 

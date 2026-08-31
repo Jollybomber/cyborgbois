@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import threading
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -58,10 +59,11 @@ SIZE_RELEVANT_HINTS = (
 )
 
 # --------------------------------------------------------------------------
-# Optional LLM assist. Fully inert unless a local HuggingFace model can be
-# loaded -- the agent works entirely without it (no paid/hosted LLM
-# required, no network call at all); when a local model IS available, it's
-# used sparingly for the two things regex/bm25 are structurally bad at:
+# Optional LLM assist. Select the backend with AGENT_LLM_PROVIDER:
+# "huggingface" (the default) runs a local model; "groq" uses Groq's
+# OpenAI-compatible chat-completions API.  Both are optional and fall back
+# to deterministic retrieval on any failure.  The model is used sparingly
+# for the two things regex/bm25 are structurally bad at:
 #   1. Slot extraction when the customer's phrasing doesn't hit our
 #      keyword lists (e.g. "water resistant" when only "waterproof" is
 #      in FEATURE_WORDS) -- called only when regex found nothing new this
@@ -71,10 +73,8 @@ SIZE_RELEVANT_HINTS = (
 #      many products sharing one generic term (e.g. "leather" matches
 #      thousands of unrelated items; a model reading titles/features can
 #      tell which one is actually a belt).
-# Any missing dependency, model-load failure, generation timeout, or bad
-# JSON falls straight back to the heuristic path with zero behavior
-# change. There is no network dependency here (unlike the old Groq-backed
-# version) -- everything runs from local weights.
+# Any missing dependency or credential, model-load/API failure, timeout, or
+# bad JSON falls straight back to the heuristic path with zero behavior change.
 # --------------------------------------------------------------------------
 try:
     import torch
@@ -84,8 +84,15 @@ except Exception:  # transformers/torch not installed -- LLM assist stays off
     AutoModelForCausalLM = None
     AutoTokenizer = None
 
-LLM_MODEL = os.environ.get("AGENT_LLM_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
+LLM_PROVIDER = os.environ.get("AGENT_LLM_PROVIDER", "huggingface").strip().lower()
+if LLM_PROVIDER == "hf":
+    LLM_PROVIDER = "huggingface"
+LLM_MODEL = os.environ.get(
+    "AGENT_LLM_MODEL",
+    "openai/gpt-oss-20b" if LLM_PROVIDER == "groq" else "Qwen/Qwen2.5-1.5B-Instruct",
+)
 LLM_LOCAL_DIR = os.environ.get("AGENT_LLM_LOCAL_DIR", "")  # optional path to a pre-downloaded snapshot
+LLM_API_KEY = os.environ.get("GROQ_API_KEY", "")
 LLM_DEVICE = os.environ.get(
     "AGENT_LLM_DEVICE",
     "cuda" if (torch is not None and torch.cuda.is_available()) else "cpu",
@@ -93,8 +100,15 @@ LLM_DEVICE = os.environ.get(
 LLM_DTYPE = os.environ.get("AGENT_LLM_DTYPE", "auto")
 # Explicit opt-out even when the dependencies/model are available.
 _LLM_DISABLED_BY_ENV = os.environ.get("AGENT_LLM_ENABLED", "1").lower() in {"0", "false", "no", "off"}
-LLM_ENABLED = (AutoModelForCausalLM is not None) and not _LLM_DISABLED_BY_ENV
-LLM_TIMEOUT_SECONDS = float(os.environ.get("AGENT_LLM_TIMEOUT_SECONDS", "15"))
+LLM_ENABLED = (
+    LLM_PROVIDER == "groq" and bool(LLM_API_KEY)
+) or (
+    LLM_PROVIDER == "huggingface" and AutoModelForCausalLM is not None
+)
+LLM_ENABLED = LLM_ENABLED and not _LLM_DISABLED_BY_ENV
+LLM_TIMEOUT_SECONDS = float(
+    os.environ.get("AGENT_LLM_TIMEOUT_SECONDS", "6" if LLM_PROVIDER == "groq" else "15")
+)
 LLM_RERANK_POOL_SIZE = 25   # candidates shown to the model for re-ranking
 DEBUG = os.environ.get("AGENT_DEBUG", "").lower() in {"1", "true", "yes", "on"}
 LOCAL_EMBEDDING_INDEX = os.environ.get("LOCAL_EMBEDDING_INDEX", str(DEFAULT_INDEX))
@@ -197,6 +211,7 @@ PRODUCT_FEATURE_FIELDS = (
 )
 LLM_SLOT_FIELDS = ("category", *HARD_ATTRIBUTES, *SOFT_ATTRIBUTES)
 LLM_INTENTS = {"buying", "browsing", "unknown"}
+PRODUCT_QUERY_FIELDS = ("title", "brand", "categories", "features", "description", "details")
 NO_PREFERENCE_RE = re.compile(
     r"\b(?:no|don't have|do not have|without|doesn't matter|does not matter)\b.*\b(?:preference|preference for)\b|"
     r"\b(?:anything|any)\s+(?:is\s+)?fine\b",
@@ -424,13 +439,17 @@ def _generate(system: str, user: str, max_tokens: int) -> tuple[str, dict]:
 
 
 def _call_llm(system: str, user: str, max_tokens: int) -> tuple[str, dict] | None:
-    """Single-turn call to a local HuggingFace causal LM. Returns (text, usage)
+    """Single-turn call to the selected LLM backend. Returns (text, usage)
     or None on any failure (no dependencies, load failure, generation
     timeout, or unexpected error). Generation runs on a bounded worker
     thread so a slow/hung local model degrades to the heuristic path
-    instead of blocking the request indefinitely, matching the network
-    -timeout behavior of the API-backed version this replaces.
+    instead of blocking the request indefinitely.
     """
+    if LLM_PROVIDER == "groq":
+        return _call_groq(system, user, max_tokens)
+    if LLM_PROVIDER != "huggingface":
+        _debug(f"unsupported LLM provider {LLM_PROVIDER!r}; using heuristic fallback")
+        return None
     if _get_llm() is None:
         return None
     try:
@@ -447,6 +466,53 @@ def _call_llm(system: str, user: str, max_tokens: int) -> tuple[str, dict] | Non
         return None
     except Exception as error:
         _debug(f"local generation failed ({error}); using heuristic fallback")
+        return None
+
+
+def _call_groq(system: str, user: str, max_tokens: int) -> tuple[str, dict] | None:
+    """Call Groq's OpenAI-compatible API, returning None on any failure."""
+    if not LLM_ENABLED:
+        return None
+    try:
+        _debug(f"calling Groq model={LLM_MODEL} max_tokens={max_tokens}")
+        payload = json.dumps(
+            {
+                "model": LLM_MODEL,
+                "max_tokens": max_tokens,
+                "temperature": 0,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            "https://api.groq.com/openai/v1/chat/completions",
+            data=payload,
+            headers={
+                "content-type": "application/json",
+                "authorization": f"Bearer {LLM_API_KEY}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=LLM_TIMEOUT_SECONDS) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        choices = body.get("choices") or []
+        message = choices[0].get("message") if choices else {}
+        result_text = message.get("content", "") if isinstance(message, dict) else ""
+        usage = body.get("usage") or {}
+        reported_usage = {
+            "input_tokens": int(usage.get("prompt_tokens", 0) or 0),
+            "output_tokens": int(usage.get("completion_tokens", 0) or 0),
+        }
+        _debug(
+            "Groq response received "
+            f"prompt_tokens={reported_usage['input_tokens']} "
+            f"completion_tokens={reported_usage['output_tokens']}"
+        )
+        return result_text, reported_usage
+    except Exception as error:
+        _debug(f"Groq request failed ({error}); using heuristic fallback")
         return None
 
 
@@ -475,11 +541,16 @@ def llm_build_turn_plan(
     system = (
         "You are the structured request planner for a shopping search agent. "
         "Reply with strict minified JSON only: no prose or markdown. "
-        "Return exactly these keys: intent, slots, budget, query_terms, summary, next_attribute. "
+        "Return exactly these keys: intent, slots, budget, query_terms, summary, next_attribute, product_query. "
         "intent is buying, browsing, or unknown. slots is an object using only the allowed "
         "attribute keys and only clear customer-stated values. budget is a numeric maximum or null. "
         "query_terms is up to 10 short search phrases grounded in the request. summary is a concise "
-        "statement of the active request. next_attribute is one allowed attribute or null."
+        "statement of the active request. next_attribute is one allowed attribute or null. "
+        "product_query is an object with exactly these string keys: title, brand, categories, "
+        "features, description, details. It must describe the requested product in the same "
+        "field shape as a catalog product. Use the full conversation and current state, preserve "
+        "only active customer constraints, and use an empty string for unknown fields; never invent "
+        "a product, brand, or specification."
     )
     user = (
         f"Allowed slot keys: {', '.join(LLM_SLOT_FIELDS)}.\n"
@@ -512,6 +583,11 @@ def llm_build_turn_plan(
     if next_attribute not in ASK_TEMPLATES:
         next_attribute = None
     intent = str(data.get("intent", "unknown")).lower()
+    raw_product_query = data.get("product_query")
+    product_query = {
+        field: str(raw_product_query.get(field, "")).strip()[:500]
+        for field in PRODUCT_QUERY_FIELDS
+    } if isinstance(raw_product_query, dict) else None
     return {
         "intent": intent if intent in LLM_INTENTS else "unknown",
         "slots": slots,
@@ -519,6 +595,7 @@ def llm_build_turn_plan(
         "query_terms": list(dict.fromkeys(query_terms)),
         "summary": str(data.get("summary", "")).strip()[:300],
         "next_attribute": next_attribute,
+        "product_query": product_query,
     }, usage
 
 
@@ -611,7 +688,7 @@ class Agent:
         self._build_index()
         self.embedding_index = self._load_embedding_index()
         _debug(f"ready; dense retrieval={'enabled' if self.embedding_index else 'disabled'}")
-        if LLM_ENABLED:
+        if LLM_ENABLED and LLM_PROVIDER == "huggingface":
             # Warm the local model at construction time rather than on the
             # first request, so latency shows up in startup, not turn 1.
             _get_llm()
@@ -822,8 +899,9 @@ class Agent:
             # profile tags, plan prose, and prior messages cannot dilute the
             # similarity query.
             dense_query = self._embedding_query(state)
+            embedded_query = self.embedding_index.embed_query(dense_query)
             dense_candidates = self.embedding_index.search(
-                dense_query, LOCAL_EMBEDDING_CANDIDATES
+                embedded_query, LOCAL_EMBEDDING_CANDIDATES
             )
             recommendations = self._hybrid_rank(
                 recommendations, dense_candidates, active_required, optional_terms,
@@ -882,8 +960,36 @@ class Agent:
 
     @staticmethod
     def _embedding_query(state: SessionState) -> str:
-        """Stable dense-retrieval input containing only current slots."""
-        return json.dumps(state.slots, ensure_ascii=False, sort_keys=True)
+        """Render the active request in the catalog's natural-language shape."""
+        planned_query = (state.turn_plan or {}).get("product_query")
+        if isinstance(planned_query, dict) and any(planned_query.values()):
+            query = planned_query
+        else:
+            # Preserve dense retrieval when no LLM is configured or its output
+            # is invalid. The LLM path above has the same six-field shape.
+            query = {
+                "title": state.slots.get("category", ""),
+                "brand": state.slots.get("brand", ""),
+                "categories": state.slots.get("category", ""),
+                "features": "; ".join(
+                    value for field, value in state.slots.items()
+                    if field in {"material", "feature", "style", "use_case"}
+                ),
+                "description": "; ".join(
+                    value for field, value in state.slots.items()
+                    if field in {"color", "size"}
+                ),
+                "details": state.slots.get("budget", ""),
+            }
+        labels = {
+            "title": "Title",
+            "brand": "Brand",
+            "categories": "Categories",
+            "features": "Features",
+            "description": "Description",
+            "details": "Details",
+        }
+        return "\n".join(f"{labels[field]}: {query.get(field, '')}" for field in PRODUCT_QUERY_FIELDS)
 
     def _hybrid_rank(
         self,
