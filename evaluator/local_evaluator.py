@@ -13,6 +13,7 @@ from starter.agent import Agent
 
 
 MAX_TURNS = 10
+DEFAULT_MAX_QUESTIONS = 3
 TOP_K = 10
 ALLOWED_ATTRIBUTES = {
     "category", "material", "color", "size", "style", "brand",
@@ -219,7 +220,10 @@ def evaluate(
     catalog_ids: set[str],
     categories: dict[str, list[str]],
     products: dict[str, dict],
+    max_questions: int = DEFAULT_MAX_QUESTIONS,
 ) -> dict:
+    if max_questions < 0:
+        raise ValueError("max_questions must be non-negative")
     sessions: list[dict] = []
     total_prompt_tokens = 0
     total_completion_tokens = 0
@@ -231,6 +235,7 @@ def evaluate(
         effective_sample = {**sample, "intent_card": effective_intent_card, "behavior": effective_behavior}
         disclosed: set[str] = set()
         boundary_used = False
+        questions_asked = 0
         override_applied = sample["scenario_type"] != "intent_override"
         user_message = initial_message(effective_sample, coarse_category(categories.get(target, [])), disclosed)
         hit_turn: int | None = None
@@ -263,8 +268,16 @@ def evaluate(
                     disclosed.add(new_value)
                 user_message = str(override.get("message", "Actually, please ignore my earlier preference."))
             else:
+                ask_attribute = response.get("ask_attribute")
+                if isinstance(ask_attribute, str) and questions_asked < max_questions:
+                    questions_asked += 1
+                else:
+                    # Once the question budget is exhausted, the customer does
+                    # not reveal additional intent. The agent can still refine
+                    # and return recommendations through the remaining turns.
+                    ask_attribute = None
                 user_message, boundary_used = customer_reply(
-                    effective_sample, response.get("ask_attribute"), disclosed, boundary_used
+                    effective_sample, ask_attribute, disclosed, boundary_used
                 )
         sessions.append({
             "sample_id": sample["sample_id"],
@@ -290,6 +303,7 @@ def evaluate(
             "completion_tokens": total_completion_tokens,
             "total_tokens": total_prompt_tokens + total_completion_tokens,
         },
+        "max_questions": max_questions,
         "scenario_metrics": {name: metric_summary(grouped[name]) for name in sorted(grouped)},
         "sessions": sessions,
     }
@@ -300,10 +314,24 @@ def main() -> None:
     parser.add_argument("--catalog", default="data/catalog.jsonl")
     parser.add_argument("--dataset", default="data/public_set.jsonl")
     parser.add_argument("--output", default="results.json")
+    parser.add_argument(
+        "--max-questions",
+        type=int,
+        default=None,
+        help=(
+            "Limit the number of evaluation cases/products to run. Each selected "
+            f"case still runs up to {MAX_TURNS} turns."
+        ),
+    )
     args = parser.parse_args()
     samples = load_jsonl(args.dataset)
+    if args.max_questions is not None:
+        if args.max_questions < 1:
+            parser.error("--max-questions must be at least 1")
+        samples = samples[:args.max_questions]
     catalog_ids, categories, products = catalog_index(args.catalog)
     result = evaluate(Agent(args.catalog), samples, catalog_ids, categories, products)
+    result["evaluation_case_limit"] = args.max_questions
     Path(args.output).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({key: value for key, value in result.items() if key != "sessions"}, indent=2))
 

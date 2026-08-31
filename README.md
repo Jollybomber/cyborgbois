@@ -40,8 +40,36 @@ Python 3.10 or later is recommended. The starter uses only the Python standard l
 python3 -m evaluator.local_evaluator
 ```
 
+By default, the simulator answers up to three clarification questions per
+session. Adjust that local limit with `--max-questions`, for example:
+
+```bash
+python3 -m evaluator.local_evaluator --max-questions 2
+```
+
 Edit `starter/agent.py` to implement your system. Do not edit the evaluator or public labels when reporting your local score.
 The command writes per-session results and aggregate metrics to `results.json`.
+
+### Optional Groq assist
+
+The agent uses its deterministic retrieval path by default. To enable the
+optional slot-extraction and reranking assist, put a Groq API key in the
+repository-root `.env` file (which is ignored by Git):
+
+```bash
+GROQ_API_KEY=...
+# Optional; defaults to openai/gpt-oss-20b
+AGENT_LLM_MODEL=openai/gpt-oss-120b
+```
+
+Values already set in your shell take precedence over `.env`. Then run:
+
+```bash
+python3 -m evaluator.local_evaluator
+```
+
+To print each customer question, retrieval trace, and any Groq API calls during
+a local run, add `AGENT_DEBUG=1` to `.env`.
 
 ## Optional local semantic index
 

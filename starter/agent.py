@@ -16,6 +16,32 @@ except Exception:  # local dense retrieval is optional
     DEFAULT_MODEL_DIR = Path("data/bge-small-en-v1.5")
     LocalEmbeddingIndex = None
 
+
+def _load_dotenv(path: Path) -> None:
+    """Load simple KEY=VALUE entries without overriding shell environment values."""
+    if not path.is_file():
+        return
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            key, separator, value = line.partition("=")
+            key = key.strip()
+            if not separator or not key or key in os.environ:
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            os.environ[key] = value
+    except OSError:
+        pass
+
+
+_load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
 # --------------------------------------------------------------------------
 # Tunable knobs. Kept at the top so they're easy to sweep during iteration.
 # --------------------------------------------------------------------------
@@ -31,7 +57,7 @@ SIZE_RELEVANT_HINTS = (
 )
 
 # --------------------------------------------------------------------------
-# Optional LLM assist. Fully inert unless ANTHROPIC_API_KEY is set in the
+# Optional LLM assist. Fully inert unless GROQ_API_KEY is set in the
 # environment -- the agent works entirely without it (no paid LLM required
 # per the competition rules); when a key IS present, it's used sparingly
 # for the two things regex/bm25 are structurally bad at:
@@ -47,11 +73,12 @@ SIZE_RELEVANT_HINTS = (
 # Any network failure, missing key, bad JSON, or timeout falls straight
 # back to the heuristic path with zero behavior change.
 # --------------------------------------------------------------------------
-LLM_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+LLM_API_KEY = os.environ.get("GROQ_API_KEY", "")
 LLM_ENABLED = bool(LLM_API_KEY)
-LLM_MODEL = os.environ.get("AGENT_LLM_MODEL", "claude-haiku-4-5-20251001")
+LLM_MODEL = os.environ.get("AGENT_LLM_MODEL", "openai/gpt-oss-20b")
 LLM_TIMEOUT_SECONDS = 6
 LLM_RERANK_POOL_SIZE = 25   # candidates shown to the model for re-ranking
+DEBUG = os.environ.get("AGENT_DEBUG", "").lower() in {"1", "true", "yes", "on"}
 LOCAL_EMBEDDING_INDEX = os.environ.get("LOCAL_EMBEDDING_INDEX", str(DEFAULT_INDEX))
 LOCAL_EMBEDDING_MODEL = os.environ.get(
     "LOCAL_EMBEDDING_MODEL",
@@ -66,6 +93,11 @@ STOPWORDS = {
     "that", "the", "this", "to", "want", "with", "would", "you", "looking",
     "have", "has", "just", "still", "need", "needs", "like", "something",
 }
+
+
+def _debug(message: str) -> None:
+    if DEBUG:
+        print(f"[agent] {message}", flush=True)
 
 # --------------------------------------------------------------------------
 # Slot vocabularies (heuristic, regex-based -- no external NLP dependency,
@@ -267,7 +299,7 @@ def extract_slots(message: str) -> tuple[dict[str, str], float | None]:
 
 
 def _call_llm(system: str, user: str, max_tokens: int) -> tuple[str, dict] | None:
-    """Single-turn call to the Anthropic Messages API. Returns (text, usage)
+    """Single-turn call to Groq's OpenAI-compatible Chat Completions API. Returns (text, usage)
     or None on any failure (no key, network error, timeout, bad response).
     Uses urllib (stdlib) so the agent has zero extra dependencies when the
     LLM path is unused.
@@ -275,35 +307,45 @@ def _call_llm(system: str, user: str, max_tokens: int) -> tuple[str, dict] | Non
     if not LLM_ENABLED:
         return None
     try:
+        _debug(f"calling Groq model={LLM_MODEL} max_tokens={max_tokens}")
         payload = json.dumps(
             {
                 "model": LLM_MODEL,
                 "max_tokens": max_tokens,
-                "system": system,
-                "messages": [{"role": "user", "content": user}],
+                "temperature": 0,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
             }
         ).encode("utf-8")
         request = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
+            "https://api.groq.com/openai/v1/chat/completions",
             data=payload,
             headers={
                 "content-type": "application/json",
-                "x-api-key": LLM_API_KEY,
-                "anthropic-version": "2023-06-01",
+                "authorization": f"Bearer {LLM_API_KEY}",
             },
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=LLM_TIMEOUT_SECONDS) as response:
             body = json.loads(response.read().decode("utf-8"))
-        text = "".join(
-            block.get("text", "") for block in body.get("content", []) if block.get("type") == "text"
-        )
+        choices = body.get("choices") or []
+        message = choices[0].get("message") if choices else {}
+        text = message.get("content", "") if isinstance(message, dict) else ""
         usage = body.get("usage") or {}
-        return text, {
-            "input_tokens": int(usage.get("input_tokens", 0) or 0),
-            "output_tokens": int(usage.get("output_tokens", 0) or 0),
+        reported_usage = {
+            "input_tokens": int(usage.get("prompt_tokens", 0) or 0),
+            "output_tokens": int(usage.get("completion_tokens", 0) or 0),
         }
-    except Exception:
+        _debug(
+            "Groq response received "
+            f"prompt_tokens={reported_usage['input_tokens']} "
+            f"completion_tokens={reported_usage['output_tokens']}"
+        )
+        return text, reported_usage
+    except Exception as error:
+        _debug(f"Groq request failed ({error}); using heuristic fallback")
         return None
 
 
@@ -434,20 +476,29 @@ class Agent:
         self.catalog_path = Path(catalog_path)
         self.connection = sqlite3.connect(":memory:")
         self._states: dict[str, SessionState] = {}
+        _debug(f"building catalog index from {self.catalog_path}")
         self._build_index()
         self.embedding_index = self._load_embedding_index()
+        _debug(f"ready; dense retrieval={'enabled' if self.embedding_index else 'disabled'}")
 
     @staticmethod
     def _load_embedding_index():
-        if LocalEmbeddingIndex is None or not Path(LOCAL_EMBEDDING_INDEX).exists():
+        index_path = Path(LOCAL_EMBEDDING_INDEX)
+        if LocalEmbeddingIndex is None:
+            _debug("embedding support is unavailable; skipping embedding index load")
+            return None
+        if not index_path.exists():
+            _debug(f"embedding index not found at {index_path}; skipping embedding build and using BM25")
             return None
         try:
+            _debug(f"found embedding index at {index_path}; skipping embedding build and loading it")
             return LocalEmbeddingIndex(
-                LOCAL_EMBEDDING_INDEX,
+                index_path,
                 LOCAL_EMBEDDING_MODEL,
                 expected_model=DEFAULT_MODEL,
             )
-        except Exception:
+        except Exception as error:
+            _debug(f"could not load existing embedding index ({error}); using BM25")
             return None
 
     def _build_index(self) -> None:
@@ -494,6 +545,7 @@ class Agent:
         if state is None:
             raise RuntimeError("reset must be called before respond")
         state.turns_seen = turn
+        _debug(f"session={session_id} turn={turn} question={user_message!r}")
 
         # A customer saying that a requested preference does not matter is a
         # useful answer, not a missing value.  Record it in the fixed schema
@@ -628,6 +680,10 @@ class Agent:
 
         over_generality = candidate_count > OVER_GENERALITY_THRESHOLD
         ask_attribute = self._choose_ask_attribute(state, over_generality, turn)
+        _debug(
+            f"session={session_id} candidates={candidate_count} "
+            f"recommendations={len(recommendations)} next_question={ask_attribute or 'none'}"
+        )
         if ask_attribute:
             state.asked_attributes.add(ask_attribute)
             state.last_asked_attribute = ask_attribute

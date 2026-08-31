@@ -2,6 +2,7 @@
   "catalog_id_field": "parent_asin",
   "top_k": 10,
   "max_turns": 10,
+  "max_questions": 3,
   "miss_turn_value": 11,
   "exact_match": true,
   "metrics": ["hit_rate_at_10", "mrr", "mttc", "reported_token_usage"],

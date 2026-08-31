@@ -35,7 +35,8 @@ Both splits use the same fixed scenario mix:
 4. The evaluator scores the first 10 unique catalog-valid `parent_asin` values.
 5. A target hit records rank and turn; otherwise the deterministic customer policy replies.
 6. An Intent Override session cannot convert before the new intent is sent.
-7. The session ends after a valid hit or turn 10.
+7. The customer answers at most three clarification questions per session. After that budget is used, no additional preference is revealed, although the Agent may still return recommendations until a valid hit or turn 10.
+8. The session ends after a valid hit or turn 10.
 
 The simulator policy decides what information to reveal. If natural-language paraphrasing is added by the organizer, it cannot decide correctness. Hits are always exact code matches.
 
