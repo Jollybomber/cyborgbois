@@ -73,6 +73,7 @@ class LocalEmbeddingIndex:
                 f"embedding index uses {stored_model!r}, expected {expected!r}"
             )
         self.ids = [str(value) for value in bundle["ids"].tolist()]
+        self._positions = {asin: position for position, asin in enumerate(self.ids)}
         self.vectors = bundle["vectors"].astype("float32", copy=False)
         # Runtime scoring must not attempt a network request.  The model is
         # downloaded once during index construction and is expected to be
@@ -94,12 +95,18 @@ class LocalEmbeddingIndex:
             [QUERY_INSTRUCTION + text], normalize_embeddings=True, show_progress_bar=False
         )[0].astype("float32", copy=False)
 
-    def search(self, query_embedding: object, top_k: int = 100) -> list[tuple[str, float]]:
+    def search(
+        self,
+        query_embedding: object,
+        top_k: int = 100,
+        candidate_ids: set[str] | None = None,
+    ) -> list[tuple[str, float]]:
         """Return the closest catalog entries for a precomputed query vector.
 
         Catalog vectors are normalized during index construction. Normalize the
         supplied query here as well so callers may pass either a raw embedding
-        or one already normalized by their embedding provider.
+        or one already normalized by their embedding provider. When
+        ``candidate_ids`` is supplied, only those catalog entries are scored.
         """
         if query_embedding is None or not self.ids or top_k <= 0:
             return []
@@ -113,11 +120,23 @@ class LocalEmbeddingIndex:
         if magnitude == 0:
             return []
         query = query / magnitude
-        scores = self.vectors @ query
+        if candidate_ids is None:
+            positions = self._np.arange(len(self.ids))
+        else:
+            positions = self._np.fromiter(
+                (self._positions[asin] for asin in candidate_ids if asin in self._positions),
+                dtype=self._np.intp,
+            )
+            if positions.size == 0:
+                return []
+        scores = self.vectors[positions] @ query
         count = min(top_k, len(scores))
         if count == len(scores):
-            positions = self._np.argsort(-scores)
+            ranked_positions = self._np.argsort(-scores)
         else:
-            positions = self._np.argpartition(-scores, count - 1)[:count]
-            positions = positions[self._np.argsort(-scores[positions])]
-        return [(self.ids[int(pos)], float(scores[int(pos)])) for pos in positions]
+            ranked_positions = self._np.argpartition(-scores, count - 1)[:count]
+            ranked_positions = ranked_positions[self._np.argsort(-scores[ranked_positions])]
+        return [
+            (self.ids[int(positions[int(rank)])], float(scores[int(rank)]))
+            for rank in ranked_positions
+        ]

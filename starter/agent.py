@@ -212,6 +212,7 @@ PRODUCT_FEATURE_FIELDS = (
 LLM_SLOT_FIELDS = ("category", *HARD_ATTRIBUTES, *SOFT_ATTRIBUTES)
 LLM_INTENTS = {"buying", "browsing", "unknown"}
 PRODUCT_QUERY_FIELDS = ("title", "brand", "categories", "features", "description", "details")
+PLAN_FILTER_FIELDS = ("category", "brand", "material", "color", "size")
 NO_PREFERENCE_RE = re.compile(
     r"\b(?:no|don't have|do not have|without|doesn't matter|does not matter)\b.*\b(?:preference|preference for)\b|"
     r"\b(?:anything|any)\s+(?:is\s+)?fine\b",
@@ -541,11 +542,13 @@ def llm_build_turn_plan(
     system = (
         "You are the structured request planner for a shopping search agent. "
         "Reply with strict minified JSON only: no prose or markdown. "
-        "Return exactly these keys: intent, slots, budget, query_terms, summary, next_attribute, product_query. "
+        "Return exactly these keys: intent, slots, budget, query_terms, summary, next_attribute, filters, product_query. "
         "intent is buying, browsing, or unknown. slots is an object using only the allowed "
         "attribute keys and only clear customer-stated values. budget is a numeric maximum or null. "
         "query_terms is up to 10 short search phrases grounded in the request. summary is a concise "
         "statement of the active request. next_attribute is one allowed attribute or null. "
+        "filters is an object with exactly these keys: category, brand, material, color, size, max_price. "
+        "Use filters only for clear hard customer constraints; use empty strings for unknown text values and null for max_price. "
         "product_query is an object with exactly these string keys: title, brand, categories, "
         "features, description, details. It must describe the requested product in the same "
         "field shape as a catalog product. Use the full conversation and current state, preserve "
@@ -588,6 +591,16 @@ def llm_build_turn_plan(
         field: str(raw_product_query.get(field, "")).strip()[:500]
         for field in PRODUCT_QUERY_FIELDS
     } if isinstance(raw_product_query, dict) else None
+    raw_filters = data.get("filters")
+    filters = {
+        field: str(raw_filters.get(field, "")).strip()[:60]
+        for field in PLAN_FILTER_FIELDS
+    } if isinstance(raw_filters, dict) else None
+    max_price = raw_filters.get("max_price") if isinstance(raw_filters, dict) else None
+    if not isinstance(max_price, (int, float)) or isinstance(max_price, bool) or max_price < 0:
+        max_price = None
+    if filters is not None:
+        filters["max_price"] = float(max_price) if max_price is not None else None
     return {
         "intent": intent if intent in LLM_INTENTS else "unknown",
         "slots": slots,
@@ -595,6 +608,7 @@ def llm_build_turn_plan(
         "query_terms": list(dict.fromkeys(query_terms)),
         "summary": str(data.get("summary", "")).strip()[:300],
         "next_attribute": next_attribute,
+        "filters": filters,
         "product_query": product_query,
     }, usage
 
@@ -900,8 +914,9 @@ class Agent:
             # similarity query.
             dense_query = self._embedding_query(state)
             embedded_query = self.embedding_index.embed_query(dense_query)
+            dense_candidate_ids = self._dense_filter_ids(state)
             dense_candidates = self.embedding_index.search(
-                embedded_query, LOCAL_EMBEDDING_CANDIDATES
+                embedded_query, LOCAL_EMBEDDING_CANDIDATES, dense_candidate_ids
             )
             recommendations = self._hybrid_rank(
                 recommendations, dense_candidates, active_required, optional_terms,
@@ -990,6 +1005,25 @@ class Agent:
             "details": "Details",
         }
         return "\n".join(f"{labels[field]}: {query.get(field, '')}" for field in PRODUCT_QUERY_FIELDS)
+
+    def _dense_filter_ids(self, state: SessionState) -> set[str] | None:
+        """Return structured-filter candidates for dense ranking, if available."""
+        planned_filters = (state.turn_plan or {}).get("filters")
+        if isinstance(planned_filters, dict):
+            filters = planned_filters
+        else:
+            filters = {
+                field: state.slots.get(field, "") for field in PLAN_FILTER_FIELDS
+            }
+            filters["max_price"] = state.budget_value
+        if not any(filters.get(field) for field in PLAN_FILTER_FIELDS) and filters.get("max_price") is None:
+            return None
+        candidate_ids = self._matching_structured_ids(filters)
+        if not candidate_ids:
+            _debug("dense structured filter found no candidates; ranking the full embedding index")
+            return None
+        _debug(f"dense structured filter retained {len(candidate_ids)} candidates")
+        return candidate_ids
 
     def _hybrid_rank(
         self,
@@ -1185,6 +1219,50 @@ class Agent:
             return int(self.connection.execute(sql, params).fetchone()[0])
         except sqlite3.OperationalError:
             return 0
+
+    def _matching_ids(self, expression: str, budget_value: float | None) -> set[str]:
+        """Return every catalog ID satisfying a lexical filter."""
+        sql = "SELECT parent_asin FROM products WHERE products MATCH ?"
+        params: list = [expression]
+        if budget_value is not None:
+            sql += " AND (price = '' OR CAST(price AS REAL) <= ?)"
+            params.append(budget_value)
+        try:
+            rows = self.connection.execute(sql, params).fetchall()
+        except sqlite3.OperationalError:
+            return set()
+        return {str(row[0]) for row in rows}
+
+    def _matching_structured_ids(self, filters: dict) -> set[str]:
+        """Filter catalog rows by validated fields before semantic ranking."""
+        field_columns = {
+            "category": "categories",
+            "brand": "store",
+            "material": "features",
+            "color": "features",
+            "size": "features",
+        }
+        fragments = [
+            f"{field_columns[field]} : {_match_term(str(filters.get(field, '')))}"
+            for field in PLAN_FILTER_FIELDS
+            if filters.get(field) and _match_term(str(filters[field]))
+        ]
+        sql = "SELECT parent_asin FROM products"
+        params: list = []
+        if fragments:
+            sql += " WHERE products MATCH ?"
+            params.append(" AND ".join(fragments))
+        else:
+            sql += " WHERE 1 = 1"
+        max_price = filters.get("max_price")
+        if max_price is not None:
+            sql += " AND (price = '' OR CAST(price AS REAL) <= ?)"
+            params.append(max_price)
+        try:
+            rows = self.connection.execute(sql, params).fetchall()
+        except sqlite3.OperationalError:
+            return set()
+        return {str(row[0]) for row in rows}
 
     def _fetch(
         self, expression: str, budget_value: float | None, rating_bias: float, top_k: int
