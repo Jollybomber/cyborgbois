@@ -8,6 +8,14 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
+try:
+    from local_embeddings import DEFAULT_INDEX, DEFAULT_MODEL, DEFAULT_MODEL_DIR, LocalEmbeddingIndex
+except Exception:  # local dense retrieval is optional
+    DEFAULT_INDEX = Path("data/catalog_bge_embeddings.npz")
+    DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
+    DEFAULT_MODEL_DIR = Path("data/bge-small-en-v1.5")
+    LocalEmbeddingIndex = None
+
 # --------------------------------------------------------------------------
 # Tunable knobs. Kept at the top so they're easy to sweep during iteration.
 # --------------------------------------------------------------------------
@@ -44,6 +52,12 @@ LLM_ENABLED = bool(LLM_API_KEY)
 LLM_MODEL = os.environ.get("AGENT_LLM_MODEL", "claude-haiku-4-5-20251001")
 LLM_TIMEOUT_SECONDS = 6
 LLM_RERANK_POOL_SIZE = 25   # candidates shown to the model for re-ranking
+LOCAL_EMBEDDING_INDEX = os.environ.get("LOCAL_EMBEDDING_INDEX", str(DEFAULT_INDEX))
+LOCAL_EMBEDDING_MODEL = os.environ.get(
+    "LOCAL_EMBEDDING_MODEL",
+    str(DEFAULT_MODEL_DIR if DEFAULT_MODEL_DIR.exists() else DEFAULT_MODEL),
+)
+LOCAL_EMBEDDING_CANDIDATES = 100
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 STOPWORDS = {
@@ -421,6 +435,20 @@ class Agent:
         self.connection = sqlite3.connect(":memory:")
         self._states: dict[str, SessionState] = {}
         self._build_index()
+        self.embedding_index = self._load_embedding_index()
+
+    @staticmethod
+    def _load_embedding_index():
+        if LocalEmbeddingIndex is None or not Path(LOCAL_EMBEDDING_INDEX).exists():
+            return None
+        try:
+            return LocalEmbeddingIndex(
+                LOCAL_EMBEDDING_INDEX,
+                LOCAL_EMBEDDING_MODEL,
+                expected_model=DEFAULT_MODEL,
+            )
+        except Exception:
+            return None
 
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
@@ -562,9 +590,26 @@ class Agent:
             else DEFAULT_RATING_BIAS
         )
 
-        recommendations, candidate_count, expression, budget_used = self._search(
-            active_required, active_optional, state.budget_value, rating_bias, top_k
+        retrieval_k = (
+            max(top_k, LOCAL_EMBEDDING_CANDIDATES)
+            if self.embedding_index is not None
+            else top_k
         )
+        recommendations, candidate_count, expression, budget_used = self._search(
+            active_required, active_optional, state.budget_value, rating_bias, retrieval_k
+        )
+
+        # Dense retrieval is a recall-oriented second route.  It is merged
+        # with FTS results before the deterministic feature-aware reranker.
+        if self.embedding_index is not None:
+            dense_query = self._describe_state(state) + "\nUser: " + user_message
+            dense_candidates = self.embedding_index.search(
+                dense_query, LOCAL_EMBEDDING_CANDIDATES
+            )
+            recommendations = self._hybrid_rank(
+                recommendations, dense_candidates, active_required, optional_terms,
+                state, rating_bias, top_k
+            )
 
         # LLM semantic re-ranking: bm25 can't discriminate between many
         # products sharing one generic matched term (e.g. "leather" hits
@@ -611,6 +656,42 @@ class Agent:
         if tags:
             parts.append("general preferences: " + ", ".join(tags))
         return "; ".join(parts) if parts else "no specific constraints stated yet"
+
+    def _hybrid_rank(
+        self,
+        lexical: list[str],
+        dense: list[tuple[str, float]],
+        required_terms: list[str],
+        optional_terms: list[str],
+        state: SessionState,
+        rating_bias: float,
+        top_k: int,
+    ) -> list[str]:
+        """Fuse FTS and dense candidates with cheap catalog-field boosts.
+
+        Dense retrieval supplies recall; lexical retrieval and explicit slots
+        supply precision.  Candidates absent from both routes are never
+        introduced, preserving the catalog-only output contract.
+        """
+        dense_rank = {asin: rank for rank, (asin, _) in enumerate(dense)}
+        pool = list(dict.fromkeys(lexical + [asin for asin, _ in dense]))
+        if not pool:
+            return []
+        lexical_rank = {asin: rank for rank, asin in enumerate(lexical)}
+        scored: list[tuple[float, str]] = []
+        for asin in pool:
+            # Raw cosine and BM25 scores are not calibrated to each other.
+            # Reciprocal rank fusion keeps either route from overwhelming the
+            # other because of an arbitrary score scale.
+            lexical_score = 1.0 / (60.0 + lexical_rank.get(asin, 10_000))
+            dense_score = 1.0 / (60.0 + dense_rank.get(asin, 10_000))
+            score = 0.65 * lexical_score + 0.35 * dense_score
+            if state.profile.get("rating_style") == "critical":
+                score += 0.005 * rating_bias
+            scored.append((score, asin))
+        scored.sort(reverse=True)
+        return [asin for _, asin in scored[:top_k]]
+
 
     # -------------------------------------------------------- ask selection
     def _choose_ask_attribute(self, state: SessionState, over_generality: bool, turn: int) -> str | None:

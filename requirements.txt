@@ -1,3 +1,5 @@
 backoff>=2.2,<3
 google-genai>=1.0,<2
 ratelimit>=2.2,<3
+numpy>=1.23,<2
+sentence-transformers>=2.7,<3

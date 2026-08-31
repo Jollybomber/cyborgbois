@@ -65,9 +65,59 @@ minute. A full 50,000-product build therefore takes at least about 8 hours and
 429 quota rejection, the script logs it, waits 30 seconds, and retries the
 same unsaved batch.
 
-Use the dense results as a candidate source or reranking signal alongside the
-starter's lexical FTS/BM25 retrieval; embeddings are not a replacement for
+Use the dense results as a candidate source alongside the starter's lexical
+FTS/BM25 retrieval; embeddings are not a replacement for
 exact category, brand, color, size, or budget filters.
+
+### Offline local embeddings
+
+The agent also supports an offline SentenceTransformers index using the
+retrieval-trained `BAAI/bge-small-en-v1.5` model. Run the following setup
+commands once from the repository root when the model and catalog index are
+not included in the checkout:
+
+```bash
+python -m pip install -r requirements.txt
+python -m scripts.build_local_embeddings \
+  --model BAAI/bge-small-en-v1.5 \
+  --model-dir data/bge-small-en-v1.5 \
+  --output data/catalog_bge_embeddings.npz \
+  --batch-size 128
+```
+
+The first command installs the local embedding dependencies. The second
+downloads and saves the BGE model, then embeds the catalog into the local
+index. It requires internet access on the first run; subsequent evaluation
+runs use the saved local model and index:
+
+```bash
+python -m evaluator.local_evaluator
+```
+
+If `data/catalog_bge_embeddings.npz` is committed but the model directory is
+not, download only the model after installing dependencies:
+
+```bash
+python -m pip install -r requirements.txt
+hf download BAAI/bge-small-en-v1.5 \
+  --local-dir data/bge-small-en-v1.5
+python -m evaluator.local_evaluator
+```
+
+If both `data/catalog_bge_embeddings.npz` and
+`data/bge-small-en-v1.5/` are committed with Git LFS, retrieve the large
+files and run the evaluator:
+
+```bash
+git lfs pull
+python -m pip install -r requirements.txt
+python -m evaluator.local_evaluator
+```
+
+The build stores both `data/catalog_bge_embeddings.npz` and a local copy of the
+embedding model under `data/bge-small-en-v1.5/`. Runtime scoring loads both
+locally and does not contact Hugging Face. Remove or override
+`LOCAL_EMBEDDING_INDEX` to run the lexical-only fallback.
 
 The included weak BM25 starter scores Hit Rate@10 `0.125`, MRR `0.068034`, and
 MTTC `9.81` on the released public set. See `docs/baseline_results.json`.
