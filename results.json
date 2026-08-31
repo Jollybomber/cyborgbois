@@ -1,0 +1,33 @@
+{
+  "sample_count": 1,
+  "hit_rate_at_10": 0.0,
+  "mrr": 0.0,
+  "mttc": 11.0,
+  "efficiency": 0.0,
+  "recommended_technical_score": 0.0,
+  "reported_token_usage": {
+    "prompt_tokens": 112,
+    "completion_tokens": 81,
+    "total_tokens": 193
+  },
+  "max_questions": 3,
+  "scenario_metrics": {
+    "buying": {
+      "sample_count": 1,
+      "hit_rate_at_10": 0.0,
+      "mrr": 0.0,
+      "mttc": 11.0
+    }
+  },
+  "sessions": [
+    {
+      "sample_id": "public_0001",
+      "scenario_type": "buying",
+      "hit": false,
+      "first_hit_turn": null,
+      "best_rank": null,
+      "reciprocal_rank": 0.0
+    }
+  ],
+  "evaluation_case_limit": 1
+}
