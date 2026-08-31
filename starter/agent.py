@@ -4,7 +4,8 @@ import json
 import os
 import re
 import sqlite3
-import urllib.request
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -57,10 +58,10 @@ SIZE_RELEVANT_HINTS = (
 )
 
 # --------------------------------------------------------------------------
-# Optional LLM assist. Fully inert unless GROQ_API_KEY is set in the
-# environment -- the agent works entirely without it (no paid LLM required
-# per the competition rules); when a key IS present, it's used sparingly
-# for the two things regex/bm25 are structurally bad at:
+# Optional LLM assist. Fully inert unless a local HuggingFace model can be
+# loaded -- the agent works entirely without it (no paid/hosted LLM
+# required, no network call at all); when a local model IS available, it's
+# used sparingly for the two things regex/bm25 are structurally bad at:
 #   1. Slot extraction when the customer's phrasing doesn't hit our
 #      keyword lists (e.g. "water resistant" when only "waterproof" is
 #      in FEATURE_WORDS) -- called only when regex found nothing new this
@@ -70,13 +71,30 @@ SIZE_RELEVANT_HINTS = (
 #      many products sharing one generic term (e.g. "leather" matches
 #      thousands of unrelated items; a model reading titles/features can
 #      tell which one is actually a belt).
-# Any network failure, missing key, bad JSON, or timeout falls straight
-# back to the heuristic path with zero behavior change.
+# Any missing dependency, model-load failure, generation timeout, or bad
+# JSON falls straight back to the heuristic path with zero behavior
+# change. There is no network dependency here (unlike the old Groq-backed
+# version) -- everything runs from local weights.
 # --------------------------------------------------------------------------
-LLM_API_KEY = os.environ.get("GROQ_API_KEY", "")
-LLM_ENABLED = bool(LLM_API_KEY)
-LLM_MODEL = os.environ.get("AGENT_LLM_MODEL", "openai/gpt-oss-20b")
-LLM_TIMEOUT_SECONDS = 6
+try:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+except Exception:  # transformers/torch not installed -- LLM assist stays off
+    torch = None
+    AutoModelForCausalLM = None
+    AutoTokenizer = None
+
+LLM_MODEL = os.environ.get("AGENT_LLM_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
+LLM_LOCAL_DIR = os.environ.get("AGENT_LLM_LOCAL_DIR", "")  # optional path to a pre-downloaded snapshot
+LLM_DEVICE = os.environ.get(
+    "AGENT_LLM_DEVICE",
+    "cuda" if (torch is not None and torch.cuda.is_available()) else "cpu",
+)
+LLM_DTYPE = os.environ.get("AGENT_LLM_DTYPE", "auto")
+# Explicit opt-out even when the dependencies/model are available.
+_LLM_DISABLED_BY_ENV = os.environ.get("AGENT_LLM_ENABLED", "1").lower() in {"0", "false", "no", "off"}
+LLM_ENABLED = (AutoModelForCausalLM is not None) and not _LLM_DISABLED_BY_ENV
+LLM_TIMEOUT_SECONDS = float(os.environ.get("AGENT_LLM_TIMEOUT_SECONDS", "15"))
 LLM_RERANK_POOL_SIZE = 25   # candidates shown to the model for re-ranking
 DEBUG = os.environ.get("AGENT_DEBUG", "").lower() in {"1", "true", "yes", "on"}
 LOCAL_EMBEDDING_INDEX = os.environ.get("LOCAL_EMBEDDING_INDEX", str(DEFAULT_INDEX))
@@ -298,54 +316,135 @@ def extract_slots(message: str) -> tuple[dict[str, str], float | None]:
     return slots, budget_value
 
 
-def _call_llm(system: str, user: str, max_tokens: int) -> tuple[str, dict] | None:
-    """Single-turn call to Groq's OpenAI-compatible Chat Completions API. Returns (text, usage)
-    or None on any failure (no key, network error, timeout, bad response).
-    Uses urllib (stdlib) so the agent has zero extra dependencies when the
-    LLM path is unused.
+# --------------------------------------------------------------------------
+# Local HuggingFace model loading. Lazy + guarded by a lock so concurrent
+# sessions don't race to load the model twice; loaded once per process and
+# reused for every _call_llm invocation thereafter.
+# --------------------------------------------------------------------------
+_llm_lock = threading.Lock()
+_llm_tokenizer = None
+_llm_model = None
+_llm_load_failed = False
+_llm_executor: ThreadPoolExecutor | None = None
+
+
+def _resolve_dtype():
+    if torch is None:
+        return None
+    if LLM_DTYPE == "auto":
+        return "auto"
+    return getattr(torch, LLM_DTYPE, "auto")
+
+
+def _get_llm():
+    """Load (once) and return (tokenizer, model), or None if unavailable.
+
+    Any exception during load permanently disables the LLM path for the
+    rest of the process (mirrors the old "bad key / network down" fallback
+    behavior of the Groq client, just for local-load failures instead).
     """
-    if not LLM_ENABLED:
+    global _llm_tokenizer, _llm_model, _llm_load_failed, LLM_ENABLED
+
+    if not LLM_ENABLED or _llm_load_failed:
+        return None
+    if _llm_model is not None:
+        return _llm_tokenizer, _llm_model
+
+    with _llm_lock:
+        if _llm_model is not None:
+            return _llm_tokenizer, _llm_model
+        if _llm_load_failed:
+            return None
+        model_path = LLM_LOCAL_DIR or LLM_MODEL
+        try:
+            _debug(f"loading local HF model '{model_path}' on device={LLM_DEVICE}")
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=_resolve_dtype(),
+            )
+            model.to(LLM_DEVICE)
+            model.eval()
+            _llm_tokenizer, _llm_model = tokenizer, model
+            _debug("local HF model loaded successfully")
+        except Exception as error:
+            _debug(f"failed to load local HF model ({error}); LLM assist disabled for this run")
+            _llm_load_failed = True
+            LLM_ENABLED = False
+            return None
+    return _llm_tokenizer, _llm_model
+
+
+def _get_executor() -> ThreadPoolExecutor:
+    global _llm_executor
+    if _llm_executor is None:
+        with _llm_lock:
+            if _llm_executor is None:
+                _llm_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm-generate")
+    return _llm_executor
+
+
+def _generate(system: str, user: str, max_tokens: int) -> tuple[str, dict]:
+    """Runs on the worker thread; raises on any failure so the caller's
+    timeout/except wrapper can fall back to heuristics uniformly.
+    """
+    tokenizer, model = _get_llm()  # already loaded by caller, cheap re-check
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    if getattr(tokenizer, "chat_template", None):
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    else:
+        prompt = f"{system}\n\n{user}\n"
+
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    input_len = inputs["input_ids"].shape[1]
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            do_sample=False,
+            num_beams=1,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        )
+
+    generated_ids = output_ids[0][input_len:]
+    text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    usage = {
+        "input_tokens": int(input_len),
+        "output_tokens": int(generated_ids.shape[0]),
+    }
+    return text, usage
+
+
+def _call_llm(system: str, user: str, max_tokens: int) -> tuple[str, dict] | None:
+    """Single-turn call to a local HuggingFace causal LM. Returns (text, usage)
+    or None on any failure (no dependencies, load failure, generation
+    timeout, or unexpected error). Generation runs on a bounded worker
+    thread so a slow/hung local model degrades to the heuristic path
+    instead of blocking the request indefinitely, matching the network
+    -timeout behavior of the API-backed version this replaces.
+    """
+    if _get_llm() is None:
         return None
     try:
-        _debug(f"calling Groq model={LLM_MODEL} max_tokens={max_tokens}")
-        payload = json.dumps(
-            {
-                "model": LLM_MODEL,
-                "max_tokens": max_tokens,
-                "temperature": 0,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-            }
-        ).encode("utf-8")
-        request = urllib.request.Request(
-            "https://api.groq.com/openai/v1/chat/completions",
-            data=payload,
-            headers={
-                "content-type": "application/json",
-                "authorization": f"Bearer {LLM_API_KEY}",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=LLM_TIMEOUT_SECONDS) as response:
-            body = json.loads(response.read().decode("utf-8"))
-        choices = body.get("choices") or []
-        message = choices[0].get("message") if choices else {}
-        text = message.get("content", "") if isinstance(message, dict) else ""
-        usage = body.get("usage") or {}
-        reported_usage = {
-            "input_tokens": int(usage.get("prompt_tokens", 0) or 0),
-            "output_tokens": int(usage.get("completion_tokens", 0) or 0),
-        }
+        _debug(f"generating locally with model={LLM_LOCAL_DIR or LLM_MODEL} max_tokens={max_tokens}")
+        future = _get_executor().submit(_generate, system, user, max_tokens)
+        text, usage = future.result(timeout=LLM_TIMEOUT_SECONDS)
         _debug(
-            "Groq response received "
-            f"prompt_tokens={reported_usage['input_tokens']} "
-            f"completion_tokens={reported_usage['output_tokens']}"
+            "local generation finished "
+            f"input_tokens={usage['input_tokens']} output_tokens={usage['output_tokens']}"
         )
-        return text, reported_usage
+        return text, usage
+    except FutureTimeoutError:
+        _debug(f"local generation exceeded {LLM_TIMEOUT_SECONDS}s timeout; using heuristic fallback")
+        return None
     except Exception as error:
-        _debug(f"Groq request failed ({error}); using heuristic fallback")
+        _debug(f"local generation failed ({error}); using heuristic fallback")
         return None
 
 
@@ -480,6 +579,10 @@ class Agent:
         self._build_index()
         self.embedding_index = self._load_embedding_index()
         _debug(f"ready; dense retrieval={'enabled' if self.embedding_index else 'disabled'}")
+        if LLM_ENABLED:
+            # Warm the local model at construction time rather than on the
+            # first request, so latency shows up in startup, not turn 1.
+            _get_llm()
 
     @staticmethod
     def _load_embedding_index():

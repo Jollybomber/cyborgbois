@@ -13,7 +13,7 @@ from starter.agent import Agent
 
 
 MAX_TURNS = 10
-DEFAULT_MAX_QUESTIONS = 3
+DEFAULT_MAX_QUESTIONS = 10
 TOP_K = 10
 ALLOWED_ATTRIBUTES = {
     "category", "material", "color", "size", "style", "brand",
