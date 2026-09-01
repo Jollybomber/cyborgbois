@@ -248,15 +248,11 @@ and constraint-based explanations for each recommendation.
 
 ## Team Contributions
 
-**TODO before submission:** add each team member’s name and concrete ownership.
-For a solo project, state that the project was designed, implemented,
-evaluated, and documented by the submitting participant.
-
-## Project Description and Demo
-
-- Devpost-ready description: `docs/DEVPOST_PROJECT_DESCRIPTION.md`
-- Demo video: **TODO — add the public YouTube URL**
-- Public repository: <https://github.com/Jollybomber/cyborgbois>
+- **Evan** — Bootstrapped the project: initial repo scaffolding, competition data/docs, the evaluator, and the first version of the starter agent with intent routing and adaptive retrieval.
+- **Gladwin** — Built the offline local embedding pipeline (`local_embeddings.py`, `scripts/build_local_embeddings.py`), integrated BGE dense retrieval into the agent, and generated the committed catalog embedding index.
+- **Lincoln** — Implemented the Gemini vector store experiment (`scripts/build_vector_store.py`) and extended the agent's structured state-filling logic across turns.
+- **Mingyang** — Wired up the deterministic context-planning pipeline end-to-end, added the test suite (`tests/test_agent.py`), and produced the pipeline benchmark results and Devpost write-up.
+- **Waylon** — Coordinated the team, reviewed and tested the agent across sessions, and drove documentation and submission readiness.
 
 ## Files
 
