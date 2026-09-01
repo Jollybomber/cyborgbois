@@ -205,6 +205,59 @@ Only exact `parent_asin` equality produces a hit. Core metrics are also reported
 
 Teams may use any legally accessible LLM API or local model. Teams manage their own credentials and must never commit API keys. Model choice, estimated cost, token usage, and latency must be disclosed. Token usage is a feasibility metric, not part of the core technical score. The organizer may reimburse model costs through prizes instead of issuing API keys.
 
+## Reproduce the Reported Result
+
+The documented `0.84` Hit Rate@10 result is the deterministic ablation with no
+LLM and no dense index. Unset model credentials and point the optional index at
+a nonexistent file:
+
+```bash
+env -u GROQ_API_KEY -u ANTHROPIC_API_KEY \
+  LOCAL_EMBEDDING_INDEX=data/disabled-index.npz \
+  python3 -m evaluator.local_evaluator \
+  --output results.json
+```
+
+Compare the aggregate metrics in `results.json` with
+`docs/pipeline_results.json`. The evaluator and public labels must remain
+unchanged.
+
+Run the focused tests with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+## Limitations and Future Improvements
+
+- Deterministic extraction cannot normalize every synonym, sizing convention,
+  or semi-structured catalog feature.
+- Candidate information gain uses lightweight catalog signals rather than a
+  learned question-value model.
+- Local dense encoding adds model startup, memory, and per-turn CPU cost and
+  did not outperform the documented lexical ablation on the complete public
+  set.
+- Groq and Anthropic planning require external credentials and may add latency
+  and cost, although the complete deterministic fallback requires neither.
+- The 200-session public set is small, so tuning can still be distribution
+  sensitive even though the runtime agent never reads labels or target IDs.
+
+With more time, we would add a compact offline cross-encoder, field-specific
+embeddings, learned question value, quantized inference, calibrated stopping,
+and constraint-based explanations for each recommendation.
+
+## Team Contributions
+
+**TODO before submission:** add each team member’s name and concrete ownership.
+For a solo project, state that the project was designed, implemented,
+evaluated, and documented by the submitting participant.
+
+## Project Description and Demo
+
+- Devpost-ready description: `docs/DEVPOST_PROJECT_DESCRIPTION.md`
+- Demo video: **TODO — add the public YouTube URL**
+- Public repository: <https://github.com/Jollybomber/cyborgbois>
+
 ## Files
 
 ```text
@@ -213,17 +266,19 @@ docs/competition_specification.md participant rules and evaluation protocol
 docs/agent_api_contract.json      machine-readable Agent contract
 docs/evaluation_config.json       scoring configuration
 docs/baseline_results.json        reproducible weak-starter reference score
-starter/agent.py                  editable weak starter
+docs/pipeline_results.json        current deterministic benchmark
+docs/DEVPOST_PROJECT_DESCRIPTION.md Devpost-ready submission copy
+starter/agent.py                  context-aware hybrid shopping agent
+local_embeddings.py              local BGE index and cosine retrieval
 evaluator/local_evaluator.py      public-set simulator and scorer
+tests/test_agent.py               focused pipeline and contract tests
 ```
 
 ## Judging and Submission Policy
 
 - Participant submission requirements: `docs/submission_rules.md`
-- Participant release checklist: `docs/participant_release_checklist.md`
-- Organizer-only final judging controls: `organizer/JUDGING_RUNBOOK.md`
-- Organizer private release checklist: `organizer/private_release_checklist.md`
-- Judging day operations SOP: `organizer/JUDGING_DAY_SOP.md`
+- Competition specification: `docs/competition_specification.md`
+- Agent API contract: `docs/agent_api_contract.json`
 
 ## Data Source
 
